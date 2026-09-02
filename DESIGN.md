@@ -75,11 +75,17 @@ aggregation logic — latest observation wins. A future multi-account raid mode 
 Added to `~/.claude/statusline.sh`:
 
 ```bash
-printf '%s' "$IN" > /dev/udp/127.0.0.1/7778 2>/dev/null || :
+printf '%s' "${IN//$'\n'/ }" > /dev/udp/127.0.0.1/7778 2>/dev/null || :
 ```
 
 Pure bash — no `nc`, no subprocess fork, non-blocking, silently no-ops when the
-agent is down. This matters: a statusline hook that blocks or returns non-zero
+agent is down.
+
+The newline strip is load-bearing: **bash's `/dev/udp` redirection emits one
+datagram per line**, so a payload containing a newline arrives as fragments,
+each invalid JSON, each dropped without a word. Claude Code sends compact
+single-line JSON today — this makes the hook immune to that changing. Found
+2026-09-03 when multi-line test payloads vanished entirely. This matters: a statusline hook that blocks or returns non-zero
 degrades the interactive TUI for every session on the machine. UDP datagrams are
 self-framing, so one JSON payload per packet needs no length prefix. The agent
 binds `127.0.0.1` only.

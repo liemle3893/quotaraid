@@ -1,0 +1,154 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>bossfight</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#000; color:#fff;
+         font:14px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  #wrap { max-width:900px; margin:0 auto; padding:16px; }
+  canvas { width:100%; height:auto; image-rendering:pixelated; display:block;
+           border:1px solid #333; }
+  .bars { margin:12px 0 4px; }
+  .row { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .lab { width:38px; color:#888; }
+  .bar { flex:1; height:16px; border:1px solid #fff; position:relative; }
+  .fill { height:100%; background:#f00; transition:width .3s linear; }
+  .fill.wk { background:#f80; }
+  .pct { width:56px; text-align:right; color:#0ff; }
+  .rst { width:92px; text-align:right; color:#888; }
+  #party { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+  .f { border:1px solid #333; padding:4px 8px; }
+  .f .n { font-weight:700; }
+  .f .s { color:#888; }
+  .f.atk .s { color:#0f0; }
+  #dead { color:#888; margin-top:10px; }
+</style>
+<div id="wrap">
+  <canvas id="c" width="640" height="360"></canvas>
+  <div class="bars">
+    <div class="row"><span class="lab">5H</span>
+      <span class="bar"><span class="fill" id="f5"></span></span>
+      <span class="pct" id="p5">--</span><span class="rst" id="r5"></span></div>
+    <div class="row"><span class="lab">7D</span>
+      <span class="bar"><span class="fill wk" id="f7"></span></span>
+      <span class="pct" id="p7">--</span><span class="rst" id="r7"></span></div>
+  </div>
+  <div id="party"></div>
+  <div id="dead">connecting…</div>
+</div>
+<script>
+const CLASS_COLOR = { opus:"#78beff", sonnet:"#ff7800", haiku:"#ffd600",
+                      fable:"#be6eff", other:"#00e66e" };
+let world = { boss:{}, fighters:[] };
+let t = 0;
+
+function fmt(sec) {
+  if (sec == null || sec < 0) return "";
+  const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function hp(w) { return w ? Math.max(0, 100 - w.used_percentage) : null; }
+
+function render() {
+  const b = world.boss || {};
+  for (const [k, w, f, p, r] of [["5", b.five_hour, "f5","p5","r5"],
+                                 ["7", b.seven_day, "f7","p7","r7"]]) {
+    const h = hp(w);
+    document.getElementById(f).style.width = (h == null ? 0 : h) + "%";
+    document.getElementById(p).textContent = h == null ? "--" : h.toFixed(1) + "%";
+    document.getElementById(r).textContent = w
+      ? fmt(w.resets_at - Math.floor(Date.now()/1000)) : "";
+  }
+  const fs = world.fighters || [];
+  document.getElementById("party").innerHTML = fs.map(f => {
+    const atk = f.__atk ? "atk" : "";
+    return `<span class="f ${atk}" style="border-color:${CLASS_COLOR[f.class]||"#555"}">
+      <span class="n" style="color:${CLASS_COLOR[f.class]||"#fff"}">${f.name}</span>
+      <span class="s">${f.machine} ${f.__atk ? "attacking" : "camping"}</span></span>`;
+  }).join("");
+  document.getElementById("dead").textContent =
+    fs.length ? "" : "no sessions — the beast is at full health";
+}
+
+// The party attacks while cost is moving. The hub does not ship a state flag;
+// it ships cost, and a rising cost is the only evidence of work there is.
+const lastCost = new Map();
+const lastMove = new Map();
+function markMovement(fs) {
+  const now = Date.now();
+  for (const f of fs) {
+    const k = f.machine + "/" + f.session_id;
+    if (lastCost.has(k) && f.cost > lastCost.get(k) + 1e-9) lastMove.set(k, now);
+    if (!lastCost.has(k)) lastMove.set(k, now);
+    lastCost.set(k, f.cost);
+    f.__atk = now - (lastMove.get(k) || 0) < 15000;
+  }
+}
+
+function draw() {
+  const c = document.getElementById("c"), g = c.getContext("2d");
+  t++;
+  g.fillStyle = "#000"; g.fillRect(0, 0, c.width, c.height);
+  const ground = c.height - 60;
+  g.strokeStyle = "#333"; g.beginPath();
+  g.moveTo(0, ground); g.lineTo(c.width, ground); g.stroke();
+
+  const h5 = hp(world.boss?.five_hour);
+  // Boss = the UNSPENT budget, so it shrinks as the party works through it.
+  if (h5 === null || h5 > 0) {
+    const scale = h5 === null ? 1 : 0.45 + 0.55 * (h5 / 100);
+    const s = 120 * scale;
+    g.save(); g.translate(c.width - 150, ground);
+    g.strokeStyle = "#fff"; g.lineWidth = 3;
+    g.beginPath(); g.arc(0, -s * 0.72, s * 0.28, 0, 7); g.stroke();
+    g.beginPath();
+    g.moveTo(-s*0.2,-s*0.95); g.lineTo(-s*0.36,-s*1.2);
+    g.moveTo( s*0.2,-s*0.95); g.lineTo( s*0.36,-s*1.2);
+    g.moveTo(0,-s*0.44); g.lineTo(0,-s*0.16);
+    g.moveTo(0,-s*0.40); g.lineTo(-s*0.34,-s*0.22);
+    g.moveTo(0,-s*0.40); g.lineTo( s*0.34,-s*0.22);
+    g.moveTo(0,-s*0.16); g.lineTo(-s*0.2,0);
+    g.moveTo(0,-s*0.16); g.lineTo( s*0.2,0);
+    g.stroke(); g.restore();
+  } else {
+    g.fillStyle = "#0f0"; g.font = "bold 22px ui-monospace,monospace";
+    g.fillText("BEAST DEFEATED — BUDGET SPENT", 40, ground - 80);
+  }
+
+  const fs = world.fighters || [];
+  fs.forEach((f, i) => {
+    const x = 40 + i * 62, col = CLASS_COLOR[f.class] || "#fff";
+    const swing = f.__atk ? Math.abs(((t + i * 5) % 16) - 8) : 0;
+    const bob = f.__atk ? 0 : (Math.floor((t + i * 3) / 24) % 2);
+    g.save(); g.translate(x + swing, ground - bob);
+    g.strokeStyle = col; g.lineWidth = 2.5;
+    g.beginPath(); g.arc(0, -46, 8, 0, 7); g.stroke();
+    g.beginPath();
+    g.moveTo(0,-38); g.lineTo(0,-18);
+    g.moveTo(0,-34); g.lineTo(-11, f.__atk ? -40 : -24);
+    g.moveTo(0,-34); g.lineTo( 11, f.__atk ? -44 : -24);
+    g.moveTo(0,-18); g.lineTo(-9, 0);
+    g.moveTo(0,-18); g.lineTo( 9, 0);
+    g.stroke(); g.restore();
+  });
+  requestAnimationFrame(draw);
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/view`);
+  ws.onmessage = e => {
+    world = JSON.parse(e.data);
+    markMovement(world.fighters || []);
+    render();
+  };
+  ws.onclose = () => {
+    document.getElementById("dead").textContent = "hub disconnected — retrying";
+    setTimeout(connect, 2000);
+  };
+}
+connect(); draw();
+</script>

@@ -1,0 +1,417 @@
+//! The wire format, shared by `agent` and `hub` so it cannot drift.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+
+/// One rate-limit window as Claude Code reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub used_percentage: f32,
+    pub resets_at: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimits {
+    #[serde(default)]
+    pub five_hour: Option<Window>,
+    #[serde(default)]
+    pub seven_day: Option<Window>,
+}
+
+/// Agent -> hub. A WHITELIST: only fields something actually draws.
+///
+/// `cwd`, `transcript_path` and the raw repo owner/name are deliberately absent.
+/// Nothing renders them, so the minimal payload and the non-leaking payload are
+/// the same struct — the safe choice costs nothing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Observation {
+    pub machine: String,
+    pub session_id: String,
+    pub session_name: Option<String>,
+    pub model_id: String,
+    pub agent_name: Option<String>,
+    pub effort: Option<String>,
+    pub thinking: bool,
+    pub zone: String,
+    pub cost_usd: f64,
+    pub rate_limits: Option<RateLimits>,
+    pub ts: i64,
+}
+
+fn s(v: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let mut cur = v;
+    for k in path {
+        cur = cur.get(k)?;
+    }
+    cur.as_str().map(|x| x.to_string())
+}
+
+/// First 8 hex of sha256 — battlegrounds stay distinguishable without being
+/// readable. sha2 rather than std's DefaultHasher because DefaultHasher's
+/// output is not stable across Rust releases, and two machines must agree.
+pub fn zone_id(repo: Option<&str>, cwd: Option<&str>) -> String {
+    let src = repo.or(cwd).unwrap_or("unknown");
+    let d = Sha256::digest(src.as_bytes());
+    d.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn class_of(model_id: &str) -> &'static str {
+    let m = model_id.to_ascii_lowercase();
+    for (needle, class) in [
+        ("opus", "opus"),
+        ("sonnet", "sonnet"),
+        ("haiku", "haiku"),
+        ("fable", "fable"),
+    ] {
+        if m.contains(needle) {
+            return class;
+        }
+    }
+    "other"
+}
+
+/// The panel's font covers 0x20-0x7E only, and the line format is
+/// space-separated. A `session_name` is whatever the user typed into `/rename`,
+/// so it is sanitised HERE — the device cannot defend itself and would render
+/// silent blanks (BOARD.md 3b).
+pub fn sanitize(input: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in input.chars() {
+        if out.chars().count() >= max {
+            break;
+        }
+        let c = c.to_ascii_uppercase();
+        match c {
+            ' ' | '\t' => out.push('_'),
+            c if (0x21u8..=0x7E).contains(&(c as u32 as u8)) && c.is_ascii() => out.push(c),
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        out.push('?');
+    }
+    out
+}
+
+impl Observation {
+    /// Build from a raw Claude Code statusline payload. `None` when the payload
+    /// carries no session — nothing else is worth reporting.
+    pub fn from_statusline(v: &serde_json::Value, machine: &str, ts: i64) -> Option<Self> {
+        let session_id = s(v, &["session_id"])?;
+        let repo = match (
+            s(v, &["workspace", "repo", "owner"]),
+            s(v, &["workspace", "repo", "name"]),
+        ) {
+            (Some(o), Some(n)) => Some(format!("{o}/{n}")),
+            _ => None,
+        };
+        let cwd = s(v, &["cwd"]).or_else(|| s(v, &["workspace", "current_dir"]));
+        Some(Observation {
+            machine: machine.to_string(),
+            session_id,
+            session_name: s(v, &["session_name"]),
+            model_id: s(v, &["model", "id"]).unwrap_or_default(),
+            agent_name: s(v, &["agent", "name"]),
+            effort: s(v, &["effort", "level"]),
+            thinking: v
+                .get("thinking")
+                .and_then(|t| t.get("enabled"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false),
+            zone: zone_id(repo.as_deref(), cwd.as_deref()),
+            cost_usd: v
+                .get("cost")
+                .and_then(|c| c.get("total_cost_usd"))
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.0),
+            rate_limits: v
+                .get("rate_limits")
+                .and_then(|r| serde_json::from_value(r.clone()).ok()),
+            ts,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Fighter {
+    pub machine: String,
+    pub session_id: String,
+    pub name: String,
+    pub class: String,
+    pub zone: String,
+    pub thinking: bool,
+    pub effort: Option<String>,
+    pub cost: f64,
+    #[serde(skip)]
+    pub last_seen_ms: u64,
+    #[serde(skip)]
+    pub last_move_ms: u64,
+}
+
+pub const FIGHTER_TTL_MS: u64 = 60_000;
+pub const COMBAT_MS: u64 = 15_000;
+
+impl Fighter {
+    pub fn attacking(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_move_ms) < COMBAT_MS
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct World {
+    pub boss: RateLimits,
+    #[serde(serialize_with = "fighters_as_vec")]
+    pub fighters: HashMap<String, Fighter>,
+}
+
+fn fighters_as_vec<S: serde::Serializer>(
+    m: &HashMap<String, Fighter>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let mut v: Vec<&Fighter> = m.values().collect();
+    v.sort_by(|a, b| (&a.machine, &a.session_id).cmp(&(&b.machine, &b.session_id)));
+    serde::Serialize::serialize(&v, s)
+}
+
+impl World {
+    pub fn apply(&mut self, o: Observation, now_ms: u64) {
+        // Boss HP is AUTHORITATIVE, never accumulated: whatever the newest
+        // observation says. That is why a dropped connection needs no queue,
+        // no replay and no at-least-once delivery — the next tick corrects it.
+        if let Some(rl) = o.rate_limits.clone() {
+            if rl.five_hour.is_some() || rl.seven_day.is_some() {
+                self.boss = rl;
+            }
+        }
+        let key = format!("{}/{}", o.machine, o.session_id);
+        let name = sanitize(
+            o.session_name
+                .as_deref()
+                .unwrap_or_else(|| &o.session_id[..o.session_id.len().min(6)]),
+            14,
+        );
+        match self.fighters.get_mut(&key) {
+            Some(f) => {
+                // Spending money is the only evidence of work we get.
+                if o.cost_usd > f.cost + 1e-9 {
+                    f.last_move_ms = now_ms;
+                }
+                f.cost = o.cost_usd;
+                f.name = name;
+                f.class = class_of(&o.model_id).to_string();
+                f.zone = o.zone;
+                f.thinking = o.thinking;
+                f.effort = o.effort;
+                f.last_seen_ms = now_ms;
+            }
+            None => {
+                self.fighters.insert(
+                    key,
+                    Fighter {
+                        machine: o.machine,
+                        session_id: o.session_id,
+                        name,
+                        class: class_of(&o.model_id).to_string(),
+                        zone: o.zone,
+                        thinking: o.thinking,
+                        effort: o.effort,
+                        cost: o.cost_usd,
+                        last_seen_ms: now_ms,
+                        last_move_ms: now_ms,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn evict(&mut self, now_ms: u64) {
+        self.fighters
+            .retain(|_, f| now_ms.saturating_sub(f.last_seen_ms) < FIGHTER_TTL_MS);
+    }
+
+    /// One header line plus one row per fighter. A line format, not JSON, so the
+    /// ESP32 needs no parser — the same reason `puck/bridge.py` used one.
+    ///
+    ///   <hp5> <hp7> <resets5> <resets7> <n>
+    ///   <class> <atk|camp> <name>
+    ///
+    /// HP is `100 - used_percentage`; `-1` means the window is absent.
+    pub fn panel_line(&self, now_ms: u64) -> String {
+        let hp = |w: Option<Window>| w.map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0);
+        let at = |w: Option<Window>| w.map(|w| w.resets_at).unwrap_or(-1);
+        let mut v: Vec<&Fighter> = self.fighters.values().collect();
+        v.sort_by(|a, b| (&a.machine, &a.session_id).cmp(&(&b.machine, &b.session_id)));
+        let mut out = format!(
+            "{:.1} {:.1} {} {} {}\n",
+            hp(self.boss.five_hour),
+            hp(self.boss.seven_day),
+            at(self.boss.five_hour),
+            at(self.boss.seven_day),
+            v.len()
+        );
+        for f in v {
+            out.push_str(&format!(
+                "{} {} {}\n",
+                f.class,
+                if f.attacking(now_ms) { "atk" } else { "camp" },
+                f.name
+            ));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn statusline() -> serde_json::Value {
+        serde_json::json!({
+            "session_id": "abcdef12-3456-7890-abcd-ef1234567890",
+            "session_name": "night owl  <build>",
+            "cwd": "/Users/someone/secret-project",
+            "transcript_path": "/Users/someone/.claude/projects/x/y.jsonl",
+            "model": { "id": "claude-opus-5", "display_name": "Opus 5" },
+            "workspace": { "repo": { "owner": "acme", "name": "private-thing" } },
+            "thinking": { "enabled": true },
+            "effort": { "level": "high" },
+            "cost": { "total_cost_usd": 1.25 },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 41.0, "resets_at": 1757000000 },
+                "seven_day": { "used_percentage": 63.0, "resets_at": 1757400000 }
+            }
+        })
+    }
+
+    #[test]
+    fn parses_statusline_and_leaks_no_paths() {
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        assert_eq!(o.class_check(), "opus");
+        assert_eq!(o.cost_usd, 1.25);
+        assert!(o.thinking);
+        let json = serde_json::to_string(&o).unwrap();
+        // The whole point of the whitelist: these must not reach the hub.
+        assert!(!json.contains("secret-project"), "cwd leaked: {json}");
+        assert!(!json.contains("private-thing"), "repo name leaked: {json}");
+        assert!(!json.contains(".jsonl"), "transcript path leaked: {json}");
+        assert_eq!(o.zone.len(), 8);
+    }
+
+    #[test]
+    fn zone_is_stable_and_differs_per_repo() {
+        assert_eq!(zone_id(Some("a/b"), None), zone_id(Some("a/b"), None));
+        assert_ne!(zone_id(Some("a/b"), None), zone_id(Some("a/c"), None));
+    }
+
+    #[test]
+    fn boss_hp_is_authoritative_not_accumulated() {
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o.clone(), 1000);
+        assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
+        // A later observation simply replaces it, even going backwards.
+        o.rate_limits = Some(RateLimits {
+            five_hour: Some(Window { used_percentage: 12.0, resets_at: 9 }),
+            seven_day: None,
+        });
+        w.apply(o, 2000);
+        assert_eq!(w.boss.five_hour.unwrap().used_percentage, 12.0);
+    }
+
+    #[test]
+    fn an_observation_without_windows_does_not_clear_the_boss() {
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o.clone(), 1000);
+        o.rate_limits = None; // API-key session, or before the first response
+        o.session_id = "other".into();
+        w.apply(o, 1100);
+        assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
+    }
+
+    #[test]
+    fn cost_movement_is_what_makes_a_fighter_attack() {
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o.clone(), 0);
+        let key = w.fighters.keys().next().unwrap().clone();
+        // Cost flat for 20s -> camping.
+        w.apply(o.clone(), 20_000);
+        assert!(!w.fighters[&key].attacking(20_000));
+        // Cost moves -> back in combat.
+        o.cost_usd = 2.0;
+        w.apply(o, 21_000);
+        assert!(w.fighters[&key].attacking(21_000));
+    }
+
+    #[test]
+    fn silent_fighters_are_evicted() {
+        let mut w = World::default();
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o, 0);
+        w.evict(FIGHTER_TTL_MS - 1);
+        assert_eq!(w.fighters.len(), 1);
+        w.evict(FIGHTER_TTL_MS + 1);
+        assert!(w.fighters.is_empty());
+    }
+
+    #[test]
+    fn two_machines_one_boss_party_is_the_union() {
+        let mut w = World::default();
+        let a = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        let b = Observation::from_statusline(&statusline(), "desk", 1).unwrap();
+        w.apply(a, 100);
+        w.apply(b, 100);
+        assert_eq!(w.fighters.len(), 2, "same session_id on two machines is two fighters");
+        assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
+    }
+
+    #[test]
+    fn panel_line_is_ascii_and_space_safe() {
+        let mut w = World::default();
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o, 0);
+        let line = w.panel_line(0);
+        let mut it = line.lines();
+        let head: Vec<&str> = it.next().unwrap().split(' ').collect();
+        assert_eq!(head.len(), 5);
+        assert_eq!(head[0], "59.0"); // 100 - 41
+        assert_eq!(head[1], "37.0"); // 100 - 63
+        assert_eq!(head[4], "1");
+        let row: Vec<&str> = it.next().unwrap().split(' ').collect();
+        assert_eq!(row.len(), 3, "a name with a space would break the row: {row:?}");
+        assert_eq!(row[0], "opus");
+        assert_eq!(row[1], "atk");
+        // The device font is 0x20-0x7E; anything else renders as a silent blank.
+        assert!(
+            line.chars().all(|c| c == '\n' || (' '..='~').contains(&c)),
+            "non-renderable byte reached the panel: {line:?}"
+        );
+    }
+
+    #[test]
+    fn absent_windows_report_minus_one_not_zero() {
+        // 0 would mean "budget spent" — the exact opposite of "unknown".
+        let w = World::default();
+        let head = w.panel_line(0).lines().next().unwrap().to_string();
+        assert!(head.starts_with("-1.0 -1.0 -1 -1 0"), "{head}");
+    }
+
+    #[test]
+    fn sanitize_strips_what_the_panel_cannot_draw() {
+        assert_eq!(sanitize("hello world", 32), "HELLO_WORLD");
+        // The dropped char leaves its neighbouring spaces behind, so runs of
+        // "_" are expected. Harmless: the invariant that matters is no spaces
+        // and nothing outside 0x21-0x7E.
+        assert_eq!(sanitize("caf\u{e9} \u{2014} x", 32), "CAF__X");
+        assert_eq!(sanitize("", 32), "?");
+        assert_eq!(sanitize("abcdefghij", 4), "ABCD");
+    }
+
+    impl Observation {
+        fn class_check(&self) -> &'static str {
+            class_of(&self.model_id)
+        }
+    }
+}
