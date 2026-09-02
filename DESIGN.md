@@ -143,9 +143,39 @@ Session key is `(machine, session_id)`.
 | `camping` | alive, `cost` flat                 | sits at a fire               |
 | `gone`    | no tick in 60 s                    | walks off screen, evicted    |
 
-**Boss death is a party wipe.** HP reaches 0, screen goes red, `RATE LIMITED`,
-stickmen lie down, respawn countdown runs to `resets_at`. Killing the boss is a
-loss, not a win — this is deliberate and needs no extra machinery.
+## The premise, and why there is no losing state
+
+**The boss is your UNSPENT budget.** The quota is paid for whether it is used or
+not, so the unused part is the thing standing in the way. Agents working are
+attacking it. Killing it means the quota got used. Idle agents camp while the
+beast stands at full health.
+
+This resolves a contradiction the first draft shipped with. That version drew
+HP reaching zero as a *defeat* — party face-down, red `RATE LIMITED`, respawn
+countdown — while the same event was also the only way to make progress. One
+event cannot be both the goal and the failure. Asked directly ("if the boss's HP
+is our budget, why do we attack from the start?"), the only coherent answer is
+that spending what you paid for is the point.
+
+So: **HP reaches 0 -> the beast is defeated -> the party celebrates -> a new
+beast walks on when the window rolls.** There is no lose condition. The boss
+still slams and knocks fighters down mid-fight, so it stays dangerous without
+anybody losing.
+
+The rejected alternative was inverting the bar so it fills as budget is
+consumed, with the party holding out until reset. Honest about overspending
+being bad, but it leaves five attackers with nothing to attack.
+
+## Boss rotation
+
+Which beast you face advances on a **window event**, never a timer, so it is
+driven by the same data as everything else:
+
+* the 7-day window resets -> new week, new beast
+* the 5-hour budget is spent -> beast defeated, a new one walks on
+
+Three beasts cycle (spider, winged, wraith). The index is persisted, so a
+restart mid-week does not reset the rotation.
 
 ## Auth and transport
 
@@ -155,6 +185,7 @@ authenticated.
 
 - `/ingest` — requires `Authorization: Bearer <token>`. It writes world state.
 - `/view` — open by default; `--view-token` gates it.
+- `/panel` — one line of plain text for the ESP32 panel. Open on the tailnet.
 
 The asymmetry is a browser constraint, not laziness: **browser WebSockets cannot
 set request headers**, so a gated `/view` must accept `?token=`, which leaks
@@ -171,6 +202,27 @@ config change rather than a rewrite), `BOSSFIGHT_TOKEN`, `BOSSFIGHT_MACHINE`.
 - Hub restarts → world rebuilds from the next tick of each agent.
 - Agent down → statusline unaffected (the `|| :` above).
 - Session silent 60 s → evicted from the party.
+
+## The ESP32 panel
+
+A second consumer: a 320x240 ILI9341 panel (`esp32/lvgl_boss/`) rendering the
+same fight in LVGL. It polls `GET /panel` with `HTTPClient` and gets back one
+line of ASCII:
+
+```
+<hp5> <hp7> <resets5> <resets7> <attacking> <camping> <down>
+41.2 63.1 1757000000 1757400000 3 1 1
+```
+
+**Not** a WebSocket. The device would need a WS library, reconnect logic and
+frame handling to gain push latency it cannot use — the upstream statusline only
+ticks every 5 seconds, so there is nothing to push faster than a poll catches.
+A line format also needs no JSON parser on the device, which is the same reason
+`puck/bridge.py` used one.
+
+The firmware already has the seams: `setWeekId()` takes `seven_day.resets_at`,
+and the victory countdown takes `five_hour.resets_at`. Until the hub exists a
+bench clock drives both through the identical code path.
 
 ## Frontend
 
