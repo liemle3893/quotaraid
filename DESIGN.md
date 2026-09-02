@@ -216,9 +216,17 @@ same fight in LVGL. It polls `GET /panel` with `HTTPClient` and gets back one
 line of ASCII:
 
 ```
-<hp5> <hp7> <resets5> <resets7> <attacking> <camping> <down>
-41.2 63.1 1757000000 1757400000 3 1 1
+<hp5> <hp7> <secs5> <secs7> <week> <n>
+48.8 36.9 7015 274935 1788654976 3
+opus   atk  PUCK_BUILD
+sonnet atk  DOCS_PASS
+haiku  camp LOG_TRIAGE
 ```
+
+Windows are sent as **seconds remaining**, not the unix epochs the API reports:
+the board has no RTC and no NTP, so an epoch would be unusable there. `week` is
+the exception and stays an epoch, because it is an identity rather than a
+duration — the firmware rotates the beast when it moves by more than an hour.
 
 **Not** a WebSocket. The device would need a WS library, reconnect logic and
 frame handling to gain push latency it cannot use — the upstream statusline only

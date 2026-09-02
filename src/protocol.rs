@@ -233,21 +233,30 @@ impl World {
     /// One header line plus one row per fighter. A line format, not JSON, so the
     /// ESP32 needs no parser — the same reason `puck/bridge.py` used one.
     ///
-    ///   <hp5> <hp7> <resets5> <resets7> <n>
+    ///   <hp5> <hp7> <secs5> <secs7> <week> <n>
     ///   <class> <atk|camp> <name>
     ///
     /// HP is `100 - used_percentage`; `-1` means the window is absent.
+    ///
+    /// Windows are sent as SECONDS REMAINING, not as the unix epoch the API
+    /// reports. The panel has no real-time clock and no NTP, so an epoch would
+    /// be unusable there; the hub already knows `now`, so it does the
+    /// subtraction. `week` stays an epoch on purpose — it is an identity, not a
+    /// duration, and the firmware rotates the beast when it changes.
     pub fn panel_line(&self, now_ms: u64) -> String {
+        let now_s = (now_ms / 1000) as i64;
         let hp = |w: Option<Window>| w.map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0);
-        let at = |w: Option<Window>| w.map(|w| w.resets_at).unwrap_or(-1);
+        let at = |w: Option<Window>| w.map(|w| (w.resets_at - now_s).max(0)).unwrap_or(-1);
+        let week = self.boss.seven_day.map(|w| w.resets_at).unwrap_or(-1);
         let mut v: Vec<&Fighter> = self.fighters.values().collect();
         v.sort_by(|a, b| (&a.machine, &a.session_id).cmp(&(&b.machine, &b.session_id)));
         let mut out = format!(
-            "{:.1} {:.1} {} {} {}\n",
+            "{:.1} {:.1} {} {} {} {}\n",
             hp(self.boss.five_hour),
             hp(self.boss.seven_day),
             at(self.boss.five_hour),
             at(self.boss.seven_day),
+            week,
             v.len()
         );
         for f in v {
@@ -375,10 +384,11 @@ mod tests {
         let line = w.panel_line(0);
         let mut it = line.lines();
         let head: Vec<&str> = it.next().unwrap().split(' ').collect();
-        assert_eq!(head.len(), 5);
+        assert_eq!(head.len(), 6);
         assert_eq!(head[0], "59.0"); // 100 - 41
         assert_eq!(head[1], "37.0"); // 100 - 63
-        assert_eq!(head[4], "1");
+        assert_eq!(head[4], "1757400000", "week is an identity, so it stays an epoch");
+        assert_eq!(head[5], "1");
         let row: Vec<&str> = it.next().unwrap().split(' ').collect();
         assert_eq!(row.len(), 3, "a name with a space would break the row: {row:?}");
         assert_eq!(row[0], "opus");
@@ -391,11 +401,33 @@ mod tests {
     }
 
     #[test]
+    fn windows_are_sent_as_seconds_remaining_not_epochs() {
+        // The panel has no clock. An epoch would be unusable there.
+        let mut w = World::default();
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o, 0);
+        let now_ms = 1_756_999_000_000u64; // 1000s before five_hour.resets_at
+        let head = w.panel_line(now_ms).lines().next().unwrap().to_string();
+        let f: Vec<&str> = head.split(' ').collect();
+        assert_eq!(f[2], "1000", "secs5 should count down: {head}");
+        assert_eq!(f[4], "1757400000", "week stays an epoch: {head}");
+    }
+
+    #[test]
+    fn a_reset_in_the_past_clamps_to_zero_not_negative() {
+        let mut w = World::default();
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o, 0);
+        let head = w.panel_line(9_000_000_000_000).lines().next().unwrap().to_string();
+        assert_eq!(head.split(' ').nth(2).unwrap(), "0", "{head}");
+    }
+
+    #[test]
     fn absent_windows_report_minus_one_not_zero() {
         // 0 would mean "budget spent" — the exact opposite of "unknown".
         let w = World::default();
         let head = w.panel_line(0).lines().next().unwrap().to_string();
-        assert!(head.starts_with("-1.0 -1.0 -1 -1 0"), "{head}");
+        assert!(head.starts_with("-1.0 -1.0 -1 -1 -1 0"), "{head}");
     }
 
     #[test]

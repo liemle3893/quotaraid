@@ -25,7 +25,7 @@ send(){ mk "$2" "$3" "$4" "$5" > /dev/udp/127.0.0.1/$1; }
 
 # --- 1: a datagram moves boss HP
 send $UDPA sess-aaaa 41.0 1.0 "night owl"
-for i in $(seq 1 100); do curl -s "http://127.0.0.1:$HUBP/panel" | head -1 | grep -q "^59.0" && break; done
+for i in $(seq 1 100); do curl -s "http://127.0.0.1:$HUBP/panel" | head -1 | grep -q '^59.0' && break; done
 H=$(curl -s "http://127.0.0.1:$HUBP/panel" | head -1)
 [[ "$H" == 59.0\ 37.0\ 1757000000\ 1757400000\ 1 ]] && ok "udp -> boss hp 59.0 (header: $H)" || no "header was: $H"
 
