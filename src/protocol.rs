@@ -63,6 +63,12 @@ pub struct Observation {
     pub activity: f64,
     #[serde(default)]
     pub source: Source,
+    /// Explicit "this session is mid-turn", when the source can tell. A session
+    /// blocked on a long bash call or a Monitor spends nothing and writes
+    /// nothing, so activity alone reports it as idle — which is wrong, it is
+    /// working. `None` means "no opinion, judge by activity".
+    #[serde(default)]
+    pub busy: Option<bool>,
     pub rate_limits: Option<RateLimits>,
     pub ts: i64,
 }
@@ -156,6 +162,7 @@ impl Observation {
             cost_usd: cost,
             activity: cost,
             source: Source::Statusline,
+            busy: None,          // a statusline cannot tell; see transcripts.rs
             rate_limits: v
                 .get("rate_limits")
                 .and_then(|r| serde_json::from_value(r.clone()).ok()),
@@ -266,6 +273,9 @@ impl World {
             };
             o.activity > prev + 1e-9
         });
+        // An explicit busy flag beats inferred movement: it is the only thing
+        // that sees a session blocked on a tool.
+        let working = o.busy.unwrap_or(false) || moved;
         // Rate limits are only current if the STATUSLINE that carried them
         // belongs to a session that just did work.
         let worked = moved && o.source == Source::Statusline;
@@ -294,7 +304,7 @@ impl World {
                 // A rising activity counter is the evidence of work. Cost comes
                 // from the statusline; transcript bytes come from sessions that
                 // never render one.
-                if moved {
+                if working {
                     f.last_move_ms = now_ms;
                 }
                 match o.source {
@@ -561,6 +571,23 @@ mod tests {
         o.session_id = "other".into();
         apply_busy(&mut w, &o, 1100);
         assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
+    }
+
+    #[test]
+    fn a_session_blocked_on_a_tool_is_still_attacking() {
+        // Waiting on a 5-minute bash call: no spend, no bytes, still working.
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        o.source = Source::Transcript;
+        o.busy = Some(true);
+        w.apply(o.clone(), 0);
+        let key = w.fighters.keys().next().unwrap().clone();
+        w.apply(o.clone(), 60_000);          // a full minute later, nothing moved
+        assert!(w.fighters[&key].attacking(60_000), "blocked-on-a-tool is working");
+
+        o.busy = Some(false);                // turn finished, waiting on a human
+        w.apply(o, 120_000);
+        assert!(!w.fighters[&key].attacking(120_000));
     }
 
     #[test]

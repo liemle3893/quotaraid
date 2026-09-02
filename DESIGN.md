@@ -305,6 +305,36 @@ window they are showing**, or display nothing — never a stale number presented
 as current. `/panel` reports `-1` for unknown, and the hub expires rate limits
 after 10 minutes rather than serving hours-old values as fact.
 
+### "Working" is not "spending"
+
+A session blocked on a five-minute bash call or a Monitor spends nothing and
+writes nothing, so every activity measure reports it as idle. It is not.
+
+Two fields that look like they answer this do not, both measured across 11 live
+sessions:
+
+* **`prompt_id`** is present for EVERY session including idle ones — it is the
+  last prompt seen, not one in flight.
+* **`cost.total_duration_ms`** is wall-clock since session start, so it advances
+  forever whether or not anything is happening.
+
+The transcript does answer it. Walk BACK to the last `assistant`/`user` message
+— transcripts interleave `attachment`, `system` and `continued-in` records, and
+the final line is usually one of those, so checking only the last line reports a
+demonstrably working session as idle. Then:
+
+| last message | meaning |
+|---|---|
+| `assistant` containing `tool_use` | blocked on a tool — working |
+| `user` (prompt or `tool_result`) | awaiting a reply — working |
+| `assistant`, text only | waiting on a human — idle |
+
+Guard it with file age. A session abandoned mid-turn stays "blocked on a tool"
+forever; one was found frozen 48 minutes in. 15 minutes covers real tool calls.
+
+`Observation.busy` carries this; `None` means "no opinion, judge by activity",
+which is what a statusline reports since it cannot tell.
+
 ### Idle is a state, not an absence
 
 The transcript watcher's liveness window was 120s, which made a quiet session
