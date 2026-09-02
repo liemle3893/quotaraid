@@ -1,7 +1,13 @@
 [package]
-name = "bossfight"
+name = "quotaraid"
 version = "0.1.0"
 edition = "2021"
+description = "Your Claude Code usage quota, rendered as a boss fight"
+license = "MIT"
+repository = "https://github.com/liemle3893/quotaraid"
+readme = "README.md"
+keywords = ["claude", "usage", "tailscale", "esp32", "monitoring"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

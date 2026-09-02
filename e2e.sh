@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end against DESIGN.md's success criteria. bash, not zsh: /dev/udp.
 set -u
-cd ~/Documents/git/Personal/bossfight
-B=./target/release/bossfight
+cd ~/Documents/git/Personal/quotaraid
+B=./target/release/quotaraid
 TOK=s3cret
 HUBP=7799; UDPA=7798; UDPB=7797
 pass=0; fail=0

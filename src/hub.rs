@@ -93,7 +93,11 @@ pub async fn run(listen: &str, token: &str, view_token: bool) -> Result<()> {
     println!("[hub]   /panel   ESP32 line format");
     println!(
         "[hub]   /ingest  agents{}",
-        if token.is_empty() { " (NO TOKEN SET — open)" } else { "" }
+        if token.is_empty() {
+            " (NO TOKEN SET — open)"
+        } else {
+            ""
+        }
     );
     axum::serve(l, router).await?;
     Ok(())
@@ -123,7 +127,8 @@ async fn ingest(
     if !bearer_ok(&app.token, &headers) {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
-    ws.on_upgrade(move |sock| ingest_socket(sock, app)).into_response()
+    ws.on_upgrade(move |sock| ingest_socket(sock, app))
+        .into_response()
 }
 
 async fn ingest_socket(mut sock: WebSocket, app: App) {
@@ -147,7 +152,8 @@ async fn view(
     if app.view_token && q.get("token").map(String::as_str) != Some(app.token.as_str()) {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
-    ws.on_upgrade(move |sock| view_socket(sock, app)).into_response()
+    ws.on_upgrade(move |sock| view_socket(sock, app))
+        .into_response()
 }
 
 async fn view_socket(sock: WebSocket, app: App) {

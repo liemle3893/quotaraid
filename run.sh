@@ -2,9 +2,9 @@
 # Bring up the hub and this machine's agent. Token lives in .env (gitignored).
 set -eu
 cd "$(dirname "$0")"
-[ -f .env ] || { echo "no .env — make one with BOSSFIGHT_TOKEN=..."; exit 1; }
+[ -f .env ] || { echo "no .env — make one with QUOTARAID_TOKEN=..."; exit 1; }
 set -a; . ./.env; set +a
-B=./target/release/bossfight
+B=./target/release/quotaraid
 [ -x "$B" ] || cargo build --release
 "$B" hub --listen 0.0.0.0:7777 &
 HUB=$!

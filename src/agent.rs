@@ -103,8 +103,9 @@ async fn forward(hub: String, token: String, mut rx: mpsc::Receiver<String>) {
 async fn connect(
     hub: &str,
     token: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>
-{
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
     let mut req = hub.into_client_request()?;
     if !token.is_empty() {
         req.headers_mut()

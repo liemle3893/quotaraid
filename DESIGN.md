@@ -1,4 +1,4 @@
-# bossfight — design
+# quotaraid — design
 
 **Date:** 2026-09-03
 **Status:** approved design, not yet implemented
@@ -52,16 +52,16 @@ boss HP. Accepted — any session coming to the foreground corrects it within 5 
 
 ```
 machine A
-  N sessions ─ statusline ─udp:7778─▶ bossfight agent ─┐
+  N sessions ─ statusline ─udp:7778─▶ quotaraid agent ─┐
                                                         │ ws + Bearer
 machine B                                               ▼
-  N sessions ─ statusline ─udp:7778─▶ bossfight agent ─▶ bossfight hub
+  N sessions ─ statusline ─udp:7778─▶ quotaraid agent ─▶ quotaraid hub
                                                         │  owns world state
                                                         ├─ ws /view ─▶ browsers
                                                         └─ token ─▶ identity
 ```
 
-One crate, two subcommands (`bossfight agent`, `bossfight hub`) sharing
+One crate, two subcommands (`quotaraid agent`, `quotaraid hub`) sharing
 `protocol.rs` so the wire format cannot drift. Hub on localhost is the
 degenerate case, used for development.
 
@@ -198,8 +198,8 @@ set request headers**, so a gated `/view` must accept `?token=`, which leaks
 tokens into access logs. Leaving a read-only view open on a private tailnet
 avoids that entirely.
 
-Config: `BOSSFIGHT_HUB` (full URL, `ws://` or `wss://`, so public hosting is a
-config change rather than a rewrite), `BOSSFIGHT_TOKEN`, `BOSSFIGHT_MACHINE`.
+Config: `QUOTARAID_HUB` (full URL, `ws://` or `wss://`, so public hosting is a
+config change rather than a rewrite), `QUOTARAID_TOKEN`, `QUOTARAID_MACHINE`.
 
 ## Failure behaviour
 
@@ -294,8 +294,9 @@ Three rules, all needed:
    shared counter meant bytes (~500k) always beat cost (~1.5), so every
    statusline update looked idle and rate limits were never trusted at all.
 
-Verified against the user's own reading: weekly 39% (they said 38), 5h 15%
-(they said 14).
+Verified against the operator's own `/usage` reading: both windows matched to
+within a percentage point once these rules were in place, where before the
+weekly figure swung by tens of points between polls.
 
 ### `five_hour` is optional and often absent
 

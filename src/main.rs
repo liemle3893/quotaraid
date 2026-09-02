@@ -1,4 +1,4 @@
-//! bossfight — Claude Code usage rendered as a boss fight.
+//! quotaraid — Claude Code usage rendered as a boss fight.
 //!
 //! One crate, two subcommands, sharing `protocol` so the wire format cannot
 //! drift between them:
@@ -19,7 +19,7 @@ mod transcripts;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "bossfight", version, about = "Claude usage as a boss fight")]
+#[command(name = "quotaraid", version, about = "Claude usage as a boss fight")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -31,12 +31,16 @@ enum Cmd {
     Agent {
         /// Full hub URL. ws:// on a tailnet; wss:// works unchanged if the hub
         /// ever moves to the public internet, so hosting stays a config change.
-        #[arg(long, env = "BOSSFIGHT_HUB", default_value = "ws://127.0.0.1:7777/ingest")]
+        #[arg(
+            long,
+            env = "QUOTARAID_HUB",
+            default_value = "ws://127.0.0.1:7777/ingest"
+        )]
         hub: String,
-        #[arg(long, env = "BOSSFIGHT_TOKEN", default_value = "")]
+        #[arg(long, env = "QUOTARAID_TOKEN", default_value = "")]
         token: String,
         /// Defaults to the hostname.
-        #[arg(long, env = "BOSSFIGHT_MACHINE")]
+        #[arg(long, env = "QUOTARAID_MACHINE")]
         machine: Option<String>,
         /// Loopback only — this accepts unauthenticated datagrams by design.
         #[arg(long, default_value = "127.0.0.1:7778")]
@@ -47,7 +51,7 @@ enum Cmd {
         #[arg(long, default_value = "0.0.0.0:7777")]
         listen: String,
         /// Required on /ingest, which writes world state.
-        #[arg(long, env = "BOSSFIGHT_TOKEN", default_value = "")]
+        #[arg(long, env = "QUOTARAID_TOKEN", default_value = "")]
         token: String,
         /// Also gate /view. Off by default: browsers cannot set request headers
         /// on a WebSocket, so gating it means a token in the query string and
@@ -71,9 +75,16 @@ fn hostname() -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
-        Cmd::Agent { hub, token, machine, listen } => {
-            agent::run(&hub, &token, &machine.unwrap_or_else(hostname), &listen).await
-        }
-        Cmd::Hub { listen, token, view_token } => hub::run(&listen, &token, view_token).await,
+        Cmd::Agent {
+            hub,
+            token,
+            machine,
+            listen,
+        } => agent::run(&hub, &token, &machine.unwrap_or_else(hostname), &listen).await,
+        Cmd::Hub {
+            listen,
+            token,
+            view_token,
+        } => hub::run(&listen, &token, view_token).await,
     }
 }

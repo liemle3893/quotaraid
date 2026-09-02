@@ -10,16 +10,11 @@ use std::collections::HashMap;
 /// (~500k) always exceeded cost (~1.5), so every transcript update looked like
 /// work and every statusline update looked idle. Rate limits, which only the
 /// statusline carries, were then never trusted and the boss had no HP at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
+    #[default]
     Statusline,
     Transcript,
-}
-
-impl Default for Source {
-    fn default() -> Self {
-        Source::Statusline
-    }
 }
 
 /// One rate-limit window as Claude Code reports it.
@@ -162,7 +157,7 @@ impl Observation {
             cost_usd: cost,
             activity: cost,
             source: Source::Statusline,
-            busy: None,          // a statusline cannot tell; see transcripts.rs
+            busy: None, // a statusline cannot tell; see transcripts.rs
             rate_limits: v
                 .get("rate_limits")
                 .and_then(|r| serde_json::from_value(r.clone()).ok()),
@@ -242,11 +237,11 @@ fn merge_window(cur: Option<Window>, new: Option<Window>) -> Option<Window> {
         (_, None) => cur,
         (None, Some(n)) => Some(n),
         (Some(c), Some(n)) => Some(if n.resets_at > c.resets_at {
-            n                                   // window rolled — start fresh
+            n // window rolled — start fresh
         } else if n.resets_at < c.resets_at {
-            c                                   // a straggler from the old window
+            c // a straggler from the old window
         } else if n.used_percentage > c.used_percentage {
-            n                                   // same window, more usage seen
+            n // same window, more usage seen
         } else {
             c
         }),
@@ -311,7 +306,9 @@ impl World {
                     Source::Statusline => f.act_sl = o.activity,
                     Source::Transcript => f.act_tr = o.activity,
                 }
-                if o.cost_usd > 0.0 { f.cost = o.cost_usd; }
+                if o.cost_usd > 0.0 {
+                    f.cost = o.cost_usd;
+                }
                 f.name = name;
                 f.class = class_of(&o.model_id).to_string();
                 f.zone = o.zone;
@@ -331,8 +328,16 @@ impl World {
                         thinking: o.thinking,
                         effort: o.effort,
                         cost: o.cost_usd,
-                        act_sl: if o.source == Source::Statusline { o.activity } else { 0.0 },
-                        act_tr: if o.source == Source::Transcript { o.activity } else { 0.0 },
+                        act_sl: if o.source == Source::Statusline {
+                            o.activity
+                        } else {
+                            0.0
+                        },
+                        act_tr: if o.source == Source::Transcript {
+                            o.activity
+                        } else {
+                            0.0
+                        },
                         last_seen_ms: now_ms,
                         last_move_ms: now_ms,
                     },
@@ -367,14 +372,22 @@ impl World {
             .boss_seen_ms
             .is_some_and(|t| now_ms.saturating_sub(t) < BOSS_TTL_MS);
         let hp = |w: Option<Window>| {
-            if !fresh { return -1.0; }
+            if !fresh {
+                return -1.0;
+            }
             w.map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0)
         };
         let at = |w: Option<Window>| {
-            if !fresh { return -1; }
+            if !fresh {
+                return -1;
+            }
             w.map(|w| (w.resets_at - now_s).max(0)).unwrap_or(-1)
         };
-        let week = if fresh { self.boss.seven_day.map(|w| w.resets_at).unwrap_or(-1) } else { -1 };
+        let week = if fresh {
+            self.boss.seven_day.map(|w| w.resets_at).unwrap_or(-1)
+        } else {
+            -1
+        };
         let mut v: Vec<&Fighter> = self.fighters.values().collect();
         v.sort_by(|a, b| (&a.machine, &a.session_id).cmp(&(&b.machine, &b.session_id)));
         let mut out = format!(
@@ -468,7 +481,10 @@ mod tests {
 
         // Same window, lower reading: ignored.
         o.rate_limits = Some(RateLimits {
-            five_hour: Some(Window { used_percentage: 12.0, resets_at: 1757000000 }),
+            five_hour: Some(Window {
+                used_percentage: 12.0,
+                resets_at: 1757000000,
+            }),
             seven_day: None,
         });
         apply_busy(&mut w, &o, 2000);
@@ -476,7 +492,10 @@ mod tests {
 
         // Window rolled: take it, even going backwards.
         o.rate_limits = Some(RateLimits {
-            five_hour: Some(Window { used_percentage: 12.0, resets_at: 1757018000 }),
+            five_hour: Some(Window {
+                used_percentage: 12.0,
+                resets_at: 1757018000,
+            }),
             seven_day: None,
         });
         apply_busy(&mut w, &o, 3000);
@@ -495,14 +514,15 @@ mod tests {
 
         let mut tr = sl.clone();
         tr.source = Source::Transcript;
-        tr.activity = 500_000.0;          // a large, unrelated unit
+        tr.activity = 500_000.0; // a large, unrelated unit
         tr.rate_limits = None;
         w.apply(tr, 1100);
 
-        sl.activity = 1.50;               // cost moved: this IS work
+        sl.activity = 1.50; // cost moved: this IS work
         w.apply(sl, 1200);
         assert_eq!(
-            w.boss.seven_day.unwrap().used_percentage, 63.0,
+            w.boss.seven_day.unwrap().used_percentage,
+            63.0,
             "a real statusline update must still count after a transcript update"
         );
     }
@@ -513,13 +533,16 @@ mod tests {
         // send is stale. Re-sending an identical payload must change nothing.
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o.clone(), 1000);        // first sighting: no prior activity
-        assert!(w.boss.seven_day.is_none(), "a first sighting proves no work");
-        w.apply(o.clone(), 2000);        // identical -> still idle
+        w.apply(o.clone(), 1000); // first sighting: no prior activity
+        assert!(
+            w.boss.seven_day.is_none(),
+            "a first sighting proves no work"
+        );
+        w.apply(o.clone(), 2000); // identical -> still idle
         assert!(w.boss.seven_day.is_none(), "an idle re-send must not count");
 
         let mut busy = o.clone();
-        busy.activity += 1.0;            // this session actually did something
+        busy.activity += 1.0; // this session actually did something
         w.apply(busy, 3000);
         assert_eq!(w.boss.seven_day.unwrap().used_percentage, 63.0);
     }
@@ -534,15 +557,21 @@ mod tests {
             o.session_id = format!("s{i}");
             o.rate_limits = Some(RateLimits {
                 five_hour: None,
-                seven_day: Some(Window { used_percentage: *pct, resets_at: 1788696000 }),
+                seven_day: Some(Window {
+                    used_percentage: *pct,
+                    resets_at: 1788696000,
+                }),
             });
             o.activity = 1.0;
-            w.apply(o.clone(), 1000 + i as u64);   // first sighting
+            w.apply(o.clone(), 1000 + i as u64); // first sighting
             o.activity = 2.0;
-            w.apply(o.clone(), 1100 + i as u64);   // now it has worked
+            w.apply(o.clone(), 1100 + i as u64); // now it has worked
         }
-        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 45.0,
-                   "must hold the highest seen, not the last to arrive");
+        assert_eq!(
+            w.boss.seven_day.unwrap().used_percentage,
+            45.0,
+            "must hold the highest seen, not the last to arrive"
+        );
     }
 
     #[test]
@@ -551,12 +580,18 @@ mod tests {
         let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
         o.rate_limits = Some(RateLimits {
             five_hour: None,
-            seven_day: Some(Window { used_percentage: 92.0, resets_at: 100 }),
+            seven_day: Some(Window {
+                used_percentage: 92.0,
+                resets_at: 100,
+            }),
         });
         apply_busy(&mut w, &o, 1000);
         o.rate_limits = Some(RateLimits {
             five_hour: None,
-            seven_day: Some(Window { used_percentage: 3.0, resets_at: 200 }),
+            seven_day: Some(Window {
+                used_percentage: 3.0,
+                resets_at: 200,
+            }),
         });
         apply_busy(&mut w, &o, 2000);
         assert_eq!(w.boss.seven_day.unwrap().used_percentage, 3.0);
@@ -582,10 +617,13 @@ mod tests {
         o.busy = Some(true);
         w.apply(o.clone(), 0);
         let key = w.fighters.keys().next().unwrap().clone();
-        w.apply(o.clone(), 60_000);          // a full minute later, nothing moved
-        assert!(w.fighters[&key].attacking(60_000), "blocked-on-a-tool is working");
+        w.apply(o.clone(), 60_000); // a full minute later, nothing moved
+        assert!(
+            w.fighters[&key].attacking(60_000),
+            "blocked-on-a-tool is working"
+        );
 
-        o.busy = Some(false);                // turn finished, waiting on a human
+        o.busy = Some(false); // turn finished, waiting on a human
         w.apply(o, 120_000);
         assert!(!w.fighters[&key].attacking(120_000));
     }
@@ -624,7 +662,11 @@ mod tests {
         let b = Observation::from_statusline(&statusline(), "desk", 1).unwrap();
         apply_busy(&mut w, &a, 100);
         apply_busy(&mut w, &b, 100);
-        assert_eq!(w.fighters.len(), 2, "same session_id on two machines is two fighters");
+        assert_eq!(
+            w.fighters.len(),
+            2,
+            "same session_id on two machines is two fighters"
+        );
         assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
     }
 
@@ -639,10 +681,17 @@ mod tests {
         assert_eq!(head.len(), 6);
         assert_eq!(head[0], "59.0"); // 100 - 41
         assert_eq!(head[1], "37.0"); // 100 - 63
-        assert_eq!(head[4], "1757400000", "week is an identity, so it stays an epoch");
+        assert_eq!(
+            head[4], "1757400000",
+            "week is an identity, so it stays an epoch"
+        );
         assert_eq!(head[5], "1");
         let row: Vec<&str> = it.next().unwrap().split(' ').collect();
-        assert_eq!(row.len(), 3, "a name with a space would break the row: {row:?}");
+        assert_eq!(
+            row.len(),
+            3,
+            "a name with a space would break the row: {row:?}"
+        );
         assert_eq!(row[0], "opus");
         assert_eq!(row[1], "atk");
         // The device font is 0x20-0x7E; anything else renders as a silent blank.
@@ -670,7 +719,12 @@ mod tests {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
         apply_busy(&mut w, &o, 9_000_000_000_000);
-        let head = w.panel_line(9_000_000_000_000).lines().next().unwrap().to_string();
+        let head = w
+            .panel_line(9_000_000_000_000)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
         assert_eq!(head.split(' ').nth(2).unwrap(), "0", "{head}");
     }
 
@@ -679,9 +733,20 @@ mod tests {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
         apply_busy(&mut w, &o, 1000);
-        assert!(w.panel_line(1000).starts_with("59.0"), "fresh should report");
-        let head = w.panel_line(1000 + BOSS_TTL_MS + 1).lines().next().unwrap().to_string();
-        assert!(head.starts_with("-1.0 -1.0 -1 -1 -1"), "stale must be unknown: {head}");
+        assert!(
+            w.panel_line(1000).starts_with("59.0"),
+            "fresh should report"
+        );
+        let head = w
+            .panel_line(1000 + BOSS_TTL_MS + 1)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            head.starts_with("-1.0 -1.0 -1 -1 -1"),
+            "stale must be unknown: {head}"
+        );
     }
 
     #[test]
