@@ -35,6 +35,14 @@ pub struct Observation {
     pub thinking: bool,
     pub zone: String,
     pub cost_usd: f64,
+    /// Any monotonically increasing measure of work. The statusline sets it to
+    /// cost; the transcript watcher sets it to bytes written. The hub only ever
+    /// asks "did this go up", so the unit does not matter — but the SOURCE does:
+    /// detached sessions (`claude --resume` under bg-pty-host) never render a
+    /// statusline, so cost alone leaves the party empty exactly when agents are
+    /// working headless.
+    #[serde(default)]
+    pub activity: f64,
     pub rate_limits: Option<RateLimits>,
     pub ts: i64,
 }
@@ -107,6 +115,11 @@ impl Observation {
             _ => None,
         };
         let cwd = s(v, &["cwd"]).or_else(|| s(v, &["workspace", "current_dir"]));
+        let cost = v
+            .get("cost")
+            .and_then(|c| c.get("total_cost_usd"))
+            .and_then(|n| n.as_f64())
+            .unwrap_or(0.0);
         Some(Observation {
             machine: machine.to_string(),
             session_id,
@@ -120,11 +133,8 @@ impl Observation {
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false),
             zone: zone_id(repo.as_deref(), cwd.as_deref()),
-            cost_usd: v
-                .get("cost")
-                .and_then(|c| c.get("total_cost_usd"))
-                .and_then(|n| n.as_f64())
-                .unwrap_or(0.0),
+            cost_usd: cost,
+            activity: cost,
             rate_limits: v
                 .get("rate_limits")
                 .and_then(|r| serde_json::from_value(r.clone()).ok()),
@@ -144,6 +154,8 @@ pub struct Fighter {
     pub effort: Option<String>,
     pub cost: f64,
     #[serde(skip)]
+    pub activity: f64,
+    #[serde(skip)]
     pub last_seen_ms: u64,
     #[serde(skip)]
     pub last_move_ms: u64,
@@ -158,9 +170,18 @@ impl Fighter {
     }
 }
 
+/// Rate limits go stale. Only the statusline can report them, and it only fires
+/// for sessions that render a UI — so with everything detached the last known
+/// numbers can be hours old. Serving them anyway made the panel display a
+/// confident, wrong boss HP for an entire session. Past this age they are
+/// reported as unknown instead.
+pub const BOSS_TTL_MS: u64 = 10 * 60 * 1000;
+
 #[derive(Debug, Default, Serialize)]
 pub struct World {
     pub boss: RateLimits,
+    #[serde(skip)]
+    pub boss_seen_ms: Option<u64>,
     #[serde(serialize_with = "fighters_as_vec")]
     pub fighters: HashMap<String, Fighter>,
 }
@@ -182,6 +203,7 @@ impl World {
         if let Some(rl) = o.rate_limits.clone() {
             if rl.five_hour.is_some() || rl.seven_day.is_some() {
                 self.boss = rl;
+                self.boss_seen_ms = Some(now_ms);
             }
         }
         let key = format!("{}/{}", o.machine, o.session_id);
@@ -193,11 +215,14 @@ impl World {
         );
         match self.fighters.get_mut(&key) {
             Some(f) => {
-                // Spending money is the only evidence of work we get.
-                if o.cost_usd > f.cost + 1e-9 {
+                // A rising activity counter is the evidence of work. Cost comes
+                // from the statusline; transcript bytes come from sessions that
+                // never render one.
+                if o.activity > f.activity + 1e-9 {
                     f.last_move_ms = now_ms;
                 }
-                f.cost = o.cost_usd;
+                f.activity = o.activity;
+                if o.cost_usd > 0.0 { f.cost = o.cost_usd; }
                 f.name = name;
                 f.class = class_of(&o.model_id).to_string();
                 f.zone = o.zone;
@@ -217,6 +242,7 @@ impl World {
                         thinking: o.thinking,
                         effort: o.effort,
                         cost: o.cost_usd,
+                        activity: o.activity,
                         last_seen_ms: now_ms,
                         last_move_ms: now_ms,
                     },
@@ -245,9 +271,20 @@ impl World {
     /// duration, and the firmware rotates the beast when it changes.
     pub fn panel_line(&self, now_ms: u64) -> String {
         let now_s = (now_ms / 1000) as i64;
-        let hp = |w: Option<Window>| w.map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0);
-        let at = |w: Option<Window>| w.map(|w| (w.resets_at - now_s).max(0)).unwrap_or(-1);
-        let week = self.boss.seven_day.map(|w| w.resets_at).unwrap_or(-1);
+        // -1 means "unknown", which the panel renders as "--". A stale number
+        // shown confidently is worse than an admitted gap.
+        let fresh = self
+            .boss_seen_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) < BOSS_TTL_MS);
+        let hp = |w: Option<Window>| {
+            if !fresh { return -1.0; }
+            w.map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0)
+        };
+        let at = |w: Option<Window>| {
+            if !fresh { return -1; }
+            w.map(|w| (w.resets_at - now_s).max(0)).unwrap_or(-1)
+        };
+        let week = if fresh { self.boss.seven_day.map(|w| w.resets_at).unwrap_or(-1) } else { -1 };
         let mut v: Vec<&Fighter> = self.fighters.values().collect();
         v.sort_by(|a, b| (&a.machine, &a.session_id).cmp(&(&b.machine, &b.session_id)));
         let mut out = format!(
@@ -350,6 +387,7 @@ mod tests {
         assert!(!w.fighters[&key].attacking(20_000));
         // Cost moves -> back in combat.
         o.cost_usd = 2.0;
+        o.activity = 2.0;
         w.apply(o, 21_000);
         assert!(w.fighters[&key].attacking(21_000));
     }
@@ -405,8 +443,8 @@ mod tests {
         // The panel has no clock. An epoch would be unusable there.
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o, 0);
         let now_ms = 1_756_999_000_000u64; // 1000s before five_hour.resets_at
+        w.apply(o, now_ms);
         let head = w.panel_line(now_ms).lines().next().unwrap().to_string();
         let f: Vec<&str> = head.split(' ').collect();
         assert_eq!(f[2], "1000", "secs5 should count down: {head}");
@@ -417,9 +455,19 @@ mod tests {
     fn a_reset_in_the_past_clamps_to_zero_not_negative() {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o, 0);
+        w.apply(o, 9_000_000_000_000);
         let head = w.panel_line(9_000_000_000_000).lines().next().unwrap().to_string();
         assert_eq!(head.split(' ').nth(2).unwrap(), "0", "{head}");
+    }
+
+    #[test]
+    fn stale_rate_limits_report_unknown_not_a_confident_wrong_number() {
+        let mut w = World::default();
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o, 1000);
+        assert!(w.panel_line(1000).starts_with("59.0"), "fresh should report");
+        let head = w.panel_line(1000 + BOSS_TTL_MS + 1).lines().next().unwrap().to_string();
+        assert!(head.starts_with("-1.0 -1.0 -1 -1 -1"), "stale must be unknown: {head}");
     }
 
     #[test]

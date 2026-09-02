@@ -14,6 +14,7 @@
 mod agent;
 mod hub;
 mod protocol;
+mod transcripts;
 
 use clap::{Parser, Subcommand};
 

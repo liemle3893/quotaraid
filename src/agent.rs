@@ -39,6 +39,22 @@ pub async fn run(hub: &str, token: &str, machine: &str, listen: &str) -> Result<
     let (tx, rx) = mpsc::channel::<String>(QUEUE);
     tokio::spawn(forward(hub.to_string(), token.to_string(), rx));
 
+    // Detached sessions never render a statusline, so poll transcripts too.
+    {
+        let tx = tx.clone();
+        let machine = machine.to_string();
+        tokio::spawn(async move {
+            loop {
+                for obs in crate::transcripts::scan(&machine) {
+                    if let Ok(j) = serde_json::to_string(&obs) {
+                        let _ = tx.try_send(j);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+    }
+
     let mut buf = vec![0u8; 64 * 1024];
     let mut dropped: u64 = 0;
     loop {
