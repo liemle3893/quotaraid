@@ -27,7 +27,7 @@ Download a binary for your platform from
 static musl, so they run on any distro with no glibc to match.
 
 ```sh
-# Linux x86_64 (also: linux-aarch64, macos-arm64, macos-x86_64)
+# Linux x86_64 (also: linux-aarch64, macos-aarch64, macos-x86_64)
 curl -fsSL -o quotaraid \
   https://github.com/liemle3893/quotaraid/releases/latest/download/quotaraid-linux-x86_64
 chmod +x quotaraid && sudo mv quotaraid /usr/local/bin/
