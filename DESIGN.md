@@ -259,6 +259,59 @@ mage); sessions with an `agent_name` render as summons. Cosmetic.
 Criterion 4 is the one that matters most: this project is not allowed to degrade
 the terminal it observes.
 
+## What the statusline actually gives you — learned in production
+
+Three assumptions in the original design were wrong, and each broke the panel in
+a way that looked like something else.
+
+### Detached sessions never render a statusline
+
+`claude --resume` under `bg-pty-host` — which is how agents actually run
+headless — has no UI, so the hook never fires. The party came up EMPTY exactly
+when work was happening. The design noted this limitation and under-weighted it:
+headless is the main use case, not an edge case.
+
+Every session writes a transcript regardless, so `src/transcripts.rs` scans
+`~/.claude/projects/**/*.jsonl` and emits an Observation per session whose file
+moved. That is the only signal that always exists.
+
+### An idle session re-sends STALE rate limits forever
+
+A statusline carries whatever THAT session last saw in an API response header.
+An idle session keeps re-sending that snapshot every 5 seconds. Measured on one
+tailnet: **11 sessions reporting 8 different values (7% to 45%) for the same
+window.** "Newest observation wins" is really "whichever session ticked last",
+so the boss HP swung with nothing changing.
+
+Three rules, all needed:
+
+1. Accept rate limits only from an observation whose session **just showed
+   movement**. An idle re-send changes nothing.
+2. Within a window take the **maximum** — usage only accrues. A larger
+   `resets_at` means the window rolled, so start fresh instead of inheriting.
+3. Track activity **per source**. The statusline measures dollars, the
+   transcript watcher measures bytes, and both describe the same session. One
+   shared counter meant bytes (~500k) always beat cost (~1.5), so every
+   statusline update looked idle and rate limits were never trusted at all.
+
+Verified against the user's own reading: weekly 39% (they said 38), 5h 15%
+(they said 14).
+
+### `five_hour` is optional and often absent
+
+The schema says "present only while the API reports it". It genuinely does not
+appear in many payloads. Consumers must fall back to `seven_day` and **say which
+window they are showing**, or display nothing — never a stale number presented
+as current. `/panel` reports `-1` for unknown, and the hub expires rate limits
+after 10 minutes rather than serving hours-old values as fact.
+
+### Idle is a state, not an absence
+
+The transcript watcher's liveness window was 120s, which made a quiet session
+DISAPPEAR from the party rather than camp. That contradicts the state model
+(attacking / idle / victory) and churned the roster every consumer draws. 30
+minutes.
+
 ## Out of scope
 
 History and replay, per-player rosters, multi-account raid mode, TLS, sound,
