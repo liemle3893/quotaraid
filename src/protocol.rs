@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+/// Where an Observation came from. The two sources measure activity in
+/// different units — cost in dollars vs transcript bytes — and BOTH describe the
+/// same session, so they must not share a counter. They did once: bytes
+/// (~500k) always exceeded cost (~1.5), so every transcript update looked like
+/// work and every statusline update looked idle. Rate limits, which only the
+/// statusline carries, were then never trusted and the boss had no HP at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    Statusline,
+    Transcript,
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Source::Statusline
+    }
+}
+
 /// One rate-limit window as Claude Code reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Window {
@@ -43,6 +61,8 @@ pub struct Observation {
     /// working headless.
     #[serde(default)]
     pub activity: f64,
+    #[serde(default)]
+    pub source: Source,
     pub rate_limits: Option<RateLimits>,
     pub ts: i64,
 }
@@ -135,6 +155,7 @@ impl Observation {
             zone: zone_id(repo.as_deref(), cwd.as_deref()),
             cost_usd: cost,
             activity: cost,
+            source: Source::Statusline,
             rate_limits: v
                 .get("rate_limits")
                 .and_then(|r| serde_json::from_value(r.clone()).ok()),
@@ -154,7 +175,9 @@ pub struct Fighter {
     pub effort: Option<String>,
     pub cost: f64,
     #[serde(skip)]
-    pub activity: f64,
+    pub act_sl: f64,
+    #[serde(skip)]
+    pub act_tr: f64,
     #[serde(skip)]
     pub last_seen_ms: u64,
     #[serde(skip)]
@@ -195,18 +218,71 @@ fn fighters_as_vec<S: serde::Serializer>(
     serde::Serialize::serialize(&v, s)
 }
 
+/// Combine an incoming window with what we already had.
+///
+/// Every session reports whatever IT last saw in an API response header, so
+/// idle sessions carry stale percentages. Measured on one tailnet: 11 sessions
+/// reporting 8 different values (7% to 45%) for the SAME window. "Newest
+/// observation wins" is really "whichever session ticked last", so the boss HP
+/// swung wildly with nothing changing.
+///
+/// Within a window, usage only accrues — so the HIGHEST value seen is the best
+/// estimate, and it is monotonic. A larger `resets_at` means the window rolled,
+/// and the new one starts from its own value rather than inheriting the old
+/// maximum.
+fn merge_window(cur: Option<Window>, new: Option<Window>) -> Option<Window> {
+    match (cur, new) {
+        (_, None) => cur,
+        (None, Some(n)) => Some(n),
+        (Some(c), Some(n)) => Some(if n.resets_at > c.resets_at {
+            n                                   // window rolled — start fresh
+        } else if n.resets_at < c.resets_at {
+            c                                   // a straggler from the old window
+        } else if n.used_percentage > c.used_percentage {
+            n                                   // same window, more usage seen
+        } else {
+            c
+        }),
+    }
+}
+
 impl World {
     pub fn apply(&mut self, o: Observation, now_ms: u64) {
-        // Boss HP is AUTHORITATIVE, never accumulated: whatever the newest
-        // observation says. That is why a dropped connection needs no queue,
-        // no replay and no at-least-once delivery — the next tick corrects it.
-        if let Some(rl) = o.rate_limits.clone() {
-            if rl.five_hour.is_some() || rl.seven_day.is_some() {
-                self.boss = rl;
-                self.boss_seen_ms = Some(now_ms);
+        let key = format!("{}/{}", o.machine, o.session_id);
+
+        // Did THIS session just do work? A statusline carries whatever that
+        // session last saw in an API response header, and an idle session
+        // re-sends that same stale snapshot every 5 seconds forever. Believing
+        // it means an hour-old percentage overwrites a fresh one — measured on
+        // one tailnet as 11 sessions reporting 8 different values (7%-45%) for
+        // the same window, with the boss HP swinging on whichever ticked last.
+        //
+        // Only a session whose activity just moved has headers worth trusting.
+        // Movement is compared against the counter for THIS source only.
+        let moved = self.fighters.get(&key).is_some_and(|f| {
+            let prev = match o.source {
+                Source::Statusline => f.act_sl,
+                Source::Transcript => f.act_tr,
+            };
+            o.activity > prev + 1e-9
+        });
+        // Rate limits are only current if the STATUSLINE that carried them
+        // belongs to a session that just did work.
+        let worked = moved && o.source == Source::Statusline;
+
+        // Boss HP is AUTHORITATIVE, never accumulated — but only from a source
+        // that is actually current. merge_window then guards the rest: within a
+        // window usage only accrues, so the max holds; a rolled window starts
+        // fresh.
+        if worked {
+            if let Some(rl) = o.rate_limits.clone() {
+                if rl.five_hour.is_some() || rl.seven_day.is_some() {
+                    self.boss.five_hour = merge_window(self.boss.five_hour, rl.five_hour);
+                    self.boss.seven_day = merge_window(self.boss.seven_day, rl.seven_day);
+                    self.boss_seen_ms = Some(now_ms);
+                }
             }
         }
-        let key = format!("{}/{}", o.machine, o.session_id);
         let name = sanitize(
             o.session_name
                 .as_deref()
@@ -218,10 +294,13 @@ impl World {
                 // A rising activity counter is the evidence of work. Cost comes
                 // from the statusline; transcript bytes come from sessions that
                 // never render one.
-                if o.activity > f.activity + 1e-9 {
+                if moved {
                     f.last_move_ms = now_ms;
                 }
-                f.activity = o.activity;
+                match o.source {
+                    Source::Statusline => f.act_sl = o.activity,
+                    Source::Transcript => f.act_tr = o.activity,
+                }
                 if o.cost_usd > 0.0 { f.cost = o.cost_usd; }
                 f.name = name;
                 f.class = class_of(&o.model_id).to_string();
@@ -242,7 +321,8 @@ impl World {
                         thinking: o.thinking,
                         effort: o.effort,
                         cost: o.cost_usd,
-                        activity: o.activity,
+                        act_sl: if o.source == Source::Statusline { o.activity } else { 0.0 },
+                        act_tr: if o.source == Source::Transcript { o.activity } else { 0.0 },
                         last_seen_ms: now_ms,
                         last_move_ms: now_ms,
                     },
@@ -312,6 +392,20 @@ impl World {
 mod tests {
     use super::*;
 
+    /// Apply as a session that just did work — the only kind whose rate limits
+    /// are trusted. First sighting establishes the fighter; the second, with
+    /// higher activity, is the one that proves the headers are current.
+    fn apply_busy(w: &mut World, o: &Observation, t: u64) {
+        let mut a = o.clone();
+        a.activity = 1.0;
+        a.source = Source::Statusline;
+        w.apply(a, t);
+        let mut b = o.clone();
+        b.activity = 2.0;
+        b.source = Source::Statusline;
+        w.apply(b, t);
+    }
+
     fn statusline() -> serde_json::Value {
         serde_json::json!({
             "session_id": "abcdef12-3456-7890-abcd-ef1234567890",
@@ -351,28 +445,121 @@ mod tests {
     }
 
     #[test]
-    fn boss_hp_is_authoritative_not_accumulated() {
+    fn boss_hp_is_authoritative_across_windows_not_accumulated() {
+        // Still never accumulated — but "authoritative" is per WINDOW. Inside
+        // one window the max wins (idle sessions report stale percentages);
+        // when the window rolls, the new value replaces outright even though it
+        // is lower. This test used to assert that any later value wins, which
+        // let a session idle for an hour drag the boss backwards.
         let mut w = World::default();
         let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o.clone(), 1000);
+        apply_busy(&mut w, &o, 1000);
         assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
-        // A later observation simply replaces it, even going backwards.
+
+        // Same window, lower reading: ignored.
         o.rate_limits = Some(RateLimits {
-            five_hour: Some(Window { used_percentage: 12.0, resets_at: 9 }),
+            five_hour: Some(Window { used_percentage: 12.0, resets_at: 1757000000 }),
             seven_day: None,
         });
-        w.apply(o, 2000);
+        apply_busy(&mut w, &o, 2000);
+        assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
+
+        // Window rolled: take it, even going backwards.
+        o.rate_limits = Some(RateLimits {
+            five_hour: Some(Window { used_percentage: 12.0, resets_at: 1757018000 }),
+            seven_day: None,
+        });
+        apply_busy(&mut w, &o, 3000);
         assert_eq!(w.boss.five_hour.unwrap().used_percentage, 12.0);
+    }
+
+    #[test]
+    fn transcript_bytes_do_not_masquerade_as_statusline_activity() {
+        // Both sources describe the same session in different units. Sharing one
+        // counter meant bytes always beat cost, so statusline updates never
+        // registered as work and rate limits were never trusted.
+        let mut w = World::default();
+        let mut sl = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        sl.activity = 1.25;
+        w.apply(sl.clone(), 1000);
+
+        let mut tr = sl.clone();
+        tr.source = Source::Transcript;
+        tr.activity = 500_000.0;          // a large, unrelated unit
+        tr.rate_limits = None;
+        w.apply(tr, 1100);
+
+        sl.activity = 1.50;               // cost moved: this IS work
+        w.apply(sl, 1200);
+        assert_eq!(
+            w.boss.seven_day.unwrap().used_percentage, 63.0,
+            "a real statusline update must still count after a transcript update"
+        );
+    }
+
+    #[test]
+    fn an_idle_session_cannot_report_rate_limits_at_all() {
+        // The user's observation: standby sessions keep sending, and what they
+        // send is stale. Re-sending an identical payload must change nothing.
+        let mut w = World::default();
+        let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        w.apply(o.clone(), 1000);        // first sighting: no prior activity
+        assert!(w.boss.seven_day.is_none(), "a first sighting proves no work");
+        w.apply(o.clone(), 2000);        // identical -> still idle
+        assert!(w.boss.seven_day.is_none(), "an idle re-send must not count");
+
+        let mut busy = o.clone();
+        busy.activity += 1.0;            // this session actually did something
+        w.apply(busy, 3000);
+        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 63.0);
+    }
+
+    #[test]
+    fn stale_sessions_cannot_drag_the_boss_backwards() {
+        // 11 real sessions on one tailnet reported 8 different percentages for
+        // the same window. Usage only accrues, so the max is the estimate.
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        for (i, pct) in [45.0f32, 7.0, 38.0, 20.0].iter().enumerate() {
+            o.session_id = format!("s{i}");
+            o.rate_limits = Some(RateLimits {
+                five_hour: None,
+                seven_day: Some(Window { used_percentage: *pct, resets_at: 1788696000 }),
+            });
+            o.activity = 1.0;
+            w.apply(o.clone(), 1000 + i as u64);   // first sighting
+            o.activity = 2.0;
+            w.apply(o.clone(), 1100 + i as u64);   // now it has worked
+        }
+        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 45.0,
+                   "must hold the highest seen, not the last to arrive");
+    }
+
+    #[test]
+    fn a_rolled_window_starts_fresh_instead_of_inheriting_the_max() {
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        o.rate_limits = Some(RateLimits {
+            five_hour: None,
+            seven_day: Some(Window { used_percentage: 92.0, resets_at: 100 }),
+        });
+        apply_busy(&mut w, &o, 1000);
+        o.rate_limits = Some(RateLimits {
+            five_hour: None,
+            seven_day: Some(Window { used_percentage: 3.0, resets_at: 200 }),
+        });
+        apply_busy(&mut w, &o, 2000);
+        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 3.0);
     }
 
     #[test]
     fn an_observation_without_windows_does_not_clear_the_boss() {
         let mut w = World::default();
         let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o.clone(), 1000);
+        apply_busy(&mut w, &o, 1000);
         o.rate_limits = None; // API-key session, or before the first response
         o.session_id = "other".into();
-        w.apply(o, 1100);
+        apply_busy(&mut w, &o, 1100);
         assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
     }
 
@@ -408,8 +595,8 @@ mod tests {
         let mut w = World::default();
         let a = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
         let b = Observation::from_statusline(&statusline(), "desk", 1).unwrap();
-        w.apply(a, 100);
-        w.apply(b, 100);
+        apply_busy(&mut w, &a, 100);
+        apply_busy(&mut w, &b, 100);
         assert_eq!(w.fighters.len(), 2, "same session_id on two machines is two fighters");
         assert_eq!(w.boss.five_hour.unwrap().used_percentage, 41.0);
     }
@@ -418,7 +605,7 @@ mod tests {
     fn panel_line_is_ascii_and_space_safe() {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o, 0);
+        apply_busy(&mut w, &o, 0);
         let line = w.panel_line(0);
         let mut it = line.lines();
         let head: Vec<&str> = it.next().unwrap().split(' ').collect();
@@ -444,7 +631,7 @@ mod tests {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
         let now_ms = 1_756_999_000_000u64; // 1000s before five_hour.resets_at
-        w.apply(o, now_ms);
+        apply_busy(&mut w, &o, now_ms);
         let head = w.panel_line(now_ms).lines().next().unwrap().to_string();
         let f: Vec<&str> = head.split(' ').collect();
         assert_eq!(f[2], "1000", "secs5 should count down: {head}");
@@ -455,7 +642,7 @@ mod tests {
     fn a_reset_in_the_past_clamps_to_zero_not_negative() {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o, 9_000_000_000_000);
+        apply_busy(&mut w, &o, 9_000_000_000_000);
         let head = w.panel_line(9_000_000_000_000).lines().next().unwrap().to_string();
         assert_eq!(head.split(' ').nth(2).unwrap(), "0", "{head}");
     }
@@ -464,7 +651,7 @@ mod tests {
     fn stale_rate_limits_report_unknown_not_a_confident_wrong_number() {
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        w.apply(o, 1000);
+        apply_busy(&mut w, &o, 1000);
         assert!(w.panel_line(1000).starts_with("59.0"), "fresh should report");
         let head = w.panel_line(1000 + BOSS_TTL_MS + 1).lines().next().unwrap().to_string();
         assert!(head.starts_with("-1.0 -1.0 -1 -1 -1"), "stale must be unknown: {head}");

@@ -9,13 +9,20 @@
 //! Nothing here reads transcript CONTENT beyond the model id: the file's byte
 //! count is the activity measure, and the session id is its filename.
 
-use crate::protocol::{zone_id, Observation};
+use crate::protocol::{zone_id, Observation, Source};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A session is "live" if its transcript was written this recently.
-const LIVE_SECS: u64 = 120;
+/// A session counts as present if its transcript was written this recently.
+///
+/// This was 120s, which made an idle session DISAPPEAR from the party rather
+/// than camp. That contradicts the state model — attacking / idle / victory —
+/// and it churned the roster: every drop and rejoin reshuffled the party the
+/// panel was drawing. Idle is a state, not an absence. 30 minutes keeps a quiet
+/// session on the field; the hub's own 60s eviction still removes anything this
+/// watcher stops reporting entirely.
+const LIVE_SECS: u64 = 30 * 60;
 
 fn projects_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
@@ -78,6 +85,7 @@ pub fn scan(machine: &str) -> Vec<Observation> {
                 zone: zone.clone(),
                 cost_usd: 0.0,          // unknown here; the statusline owns cost
                 activity: len as f64,   // bytes written IS the work signal
+                source: Source::Transcript,
                 rate_limits: None,      // only the statusline can report these
                 ts: now as i64,
             });
