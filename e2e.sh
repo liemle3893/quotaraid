@@ -8,6 +8,11 @@ HUBP=7799; UDPA=7798; UDPB=7797
 # The transcript watcher scans $HOME/.claude, so on a real machine every live
 # session joined the fixture and the fighter counts were whatever happened to be
 # running. Give the agents an empty HOME so this suite tests only what it sends.
+# Windows must reset in the FUTURE. These were fixed epochs, which quietly
+# became the past — and a window past its reset is now correctly reported as
+# unknown, so the fixture was asserting against expired data.
+R5=$(( $(date +%s) + 3600 ))
+R7=$(( $(date +%s) + 3 * 86400 ))
 ISO=$(mktemp -d)
 trap 'rm -rf "$ISO"' EXIT
 pass=0; fail=0
@@ -24,7 +29,7 @@ for i in $(seq 1 200); do grep -q connected /tmp/bf_a.log && grep -q connected /
 mk(){ # $1 session_id  $2 pct  $3 cost  $4 name
 # SINGLE LINE on purpose: bash's /dev/udp sends one datagram per line, which is
 # what the real statusline hook does too (it strips newlines before writing).
-printf '%s' '{"session_id":"'"$1"'","session_name":"'"$4"'","cwd":"/Users/x/secret-proj","transcript_path":"/Users/x/.claude/projects/p/t.jsonl","model":{"id":"claude-opus-5"},"workspace":{"repo":{"owner":"acme","name":"topsecret"}},"thinking":{"enabled":false},"cost":{"total_cost_usd":'"$3"'},"rate_limits":{"five_hour":{"used_percentage":'"$2"',"resets_at":1757000000},"seven_day":{"used_percentage":63.0,"resets_at":1757400000}}}'
+printf '%s' '{"session_id":"'"$1"'","session_name":"'"$4"'","cwd":"/Users/x/secret-proj","transcript_path":"/Users/x/.claude/projects/p/t.jsonl","model":{"id":"claude-opus-5"},"workspace":{"repo":{"owner":"acme","name":"topsecret"}},"thinking":{"enabled":false},"cost":{"total_cost_usd":'"$3"'},"rate_limits":{"five_hour":{"used_percentage":'"$2"',"resets_at":'"$R5"'},"seven_day":{"used_percentage":63.0,"resets_at":'"$R7"'}}}'
 }
 # Sends TWICE with a rising cost. The hub only believes rate limits from a
 # session that just did work — a first sighting proves nothing, and an idle
