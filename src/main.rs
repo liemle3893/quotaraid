@@ -15,6 +15,7 @@ mod agent;
 mod hub;
 mod protocol;
 mod transcripts;
+mod usage;
 
 use clap::{Parser, Subcommand};
 
@@ -45,6 +46,14 @@ enum Cmd {
         /// Loopback only — this accepts unauthenticated datagrams by design.
         #[arg(long, default_value = "127.0.0.1:7778")]
         listen: String,
+        /// Also poll Claude Code's own usage endpoint for quota.
+        ///
+        /// Off by default: the endpoint is UNDOCUMENTED and this reads your
+        /// OAuth token. Worth it because the statusline does not reliably carry
+        /// the 5-hour window — measured at 0 of 92 payloads while the endpoint
+        /// reported it at 2%.
+        #[arg(long)]
+        oauth_usage: bool,
     },
     /// Own the world state and serve it.
     Hub {
@@ -80,7 +89,17 @@ async fn main() -> anyhow::Result<()> {
             token,
             machine,
             listen,
-        } => agent::run(&hub, &token, &machine.unwrap_or_else(hostname), &listen).await,
+            oauth_usage,
+        } => {
+            agent::run(
+                &hub,
+                &token,
+                &machine.unwrap_or_else(hostname),
+                &listen,
+                oauth_usage,
+            )
+            .await
+        }
         Cmd::Hub {
             listen,
             token,

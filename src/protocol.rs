@@ -15,6 +15,12 @@ pub enum Source {
     #[default]
     Statusline,
     Transcript,
+    /// A direct reading from `/api/oauth/usage`. Unlike a statusline — which
+    /// reports whatever header that session last happened to see — this is a
+    /// live measurement, so it is trusted without needing a session to have
+    /// just spent. It is also the only source that carries the 5-hour window
+    /// reliably.
+    Usage,
 }
 
 /// One rate-limit window as Claude Code reports it.
@@ -256,6 +262,9 @@ impl World {
             let prev = match o.source {
                 Source::Statusline => f.act_sl,
                 Source::Transcript => f.act_tr,
+                // Carries no activity of its own — it is a quota reading, not
+                // a session. Never counts as movement.
+                Source::Usage => f64::INFINITY,
             };
             o.activity > prev + 1e-9
         });
@@ -264,7 +273,7 @@ impl World {
         let working = o.busy.unwrap_or(false) || moved;
         // Rate limits are only current if the STATUSLINE that carried them
         // belongs to a session that just did work.
-        let worked = moved && o.source == Source::Statusline;
+        let worked = (moved && o.source == Source::Statusline) || o.source == Source::Usage;
 
         // Boss HP is AUTHORITATIVE, never accumulated — but only from a source
         // that is actually current. merge_window then guards the rest: within a
@@ -295,6 +304,7 @@ impl World {
                 match o.source {
                     Source::Statusline => f.act_sl = o.activity,
                     Source::Transcript => f.act_tr = o.activity,
+                    Source::Usage => {}
                 }
                 if o.cost_usd > 0.0 {
                     f.cost = o.cost_usd;

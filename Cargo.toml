@@ -19,6 +19,8 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 tokio-tungstenite = "0.23"
+# rustls, not native-tls: the release builds are static musl and must not link OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [profile.release]
 opt-level = "z"

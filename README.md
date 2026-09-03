@@ -62,8 +62,25 @@ per line**, so a payload containing a newline arrives as fragments that are each
 invalid JSON and each dropped without a word.
 
 Don't have a `statusline.sh`? You still get the party — the agent watches
-transcripts too. You just won't get quota numbers, which only a statusline can
-report.
+transcripts too.
+
+### The 5-hour window needs `--oauth-usage`
+
+The statusline does not reliably carry it. Measured on a live tailnet: **92
+consecutive payloads, 92 carrying `seven_day`, zero carrying `five_hour`** —
+while Claude Code's own usage endpoint reported the 5-hour window at 2% at the
+same moment. An absent window does not mean zero usage.
+
+```sh
+quotaraid agent --hub ws://<hub>:7777/ingest --oauth-usage
+```
+
+This polls `/api/oauth/usage` — the endpoint `/usage` itself calls — once a
+minute, reading your Claude Code OAuth token from the macOS keychain or
+`~/.claude/.credentials.json`. It is **off by default** because the endpoint is
+undocumented and may change in any release, and because it reads your token.
+The token is sent only to `api.anthropic.com`, where it already goes, and never
+appears in any Observation or log.
 
 ## Endpoints
 

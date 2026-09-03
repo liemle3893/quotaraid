@@ -32,7 +32,13 @@ use tokio_tungstenite::tungstenite::Message;
 /// replay stale percentages over fresh ones.
 const QUEUE: usize = 8;
 
-pub async fn run(hub: &str, token: &str, machine: &str, listen: &str) -> Result<()> {
+pub async fn run(
+    hub: &str,
+    token: &str,
+    machine: &str,
+    listen: &str,
+    oauth_usage: bool,
+) -> Result<()> {
     let sock = UdpSocket::bind(listen).await?;
     println!("[agent] {machine}: udp {listen} -> {hub}");
 
@@ -51,6 +57,47 @@ pub async fn run(hub: &str, token: &str, machine: &str, listen: &str) -> Result<
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+    }
+
+    if oauth_usage {
+        let tx = tx.clone();
+        let machine = machine.to_string();
+        tokio::spawn(async move {
+            loop {
+                match tokio::task::spawn_blocking(crate::usage::fetch).await {
+                    Ok(Ok(rl)) => {
+                        let ts = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        // A quota reading, not a fighter: it carries no session
+                        // of its own, and the hub keys fighters by session id.
+                        let obs = Observation {
+                            machine: machine.clone(),
+                            session_id: "oauth-usage".into(),
+                            session_name: None,
+                            model_id: String::new(),
+                            agent_name: None,
+                            effort: None,
+                            thinking: false,
+                            zone: String::new(),
+                            cost_usd: 0.0,
+                            activity: 0.0,
+                            source: crate::protocol::Source::Usage,
+                            busy: Some(false),
+                            rate_limits: Some(rl),
+                            ts,
+                        };
+                        if let Ok(j) = serde_json::to_string(&obs) {
+                            let _ = tx.try_send(j);
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!("[agent] usage endpoint: {e}"),
+                    Err(e) => eprintln!("[agent] usage task: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }
