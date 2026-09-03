@@ -195,18 +195,9 @@ impl Fighter {
     }
 }
 
-/// Rate limits go stale. Only the statusline can report them, and it only fires
-/// for sessions that render a UI — so with everything detached the last known
-/// numbers can be hours old. Serving them anyway made the panel display a
-/// confident, wrong boss HP for an entire session. Past this age they are
-/// reported as unknown instead.
-pub const BOSS_TTL_MS: u64 = 10 * 60 * 1000;
-
 #[derive(Debug, Default, Serialize)]
 pub struct World {
     pub boss: RateLimits,
-    #[serde(skip)]
-    pub boss_seen_ms: Option<u64>,
     #[serde(serialize_with = "fighters_as_vec")]
     pub fighters: HashMap<String, Fighter>,
 }
@@ -284,7 +275,6 @@ impl World {
                 if rl.five_hour.is_some() || rl.seven_day.is_some() {
                     self.boss.five_hour = merge_window(self.boss.five_hour, rl.five_hour);
                     self.boss.seven_day = merge_window(self.boss.seven_day, rl.seven_day);
-                    self.boss_seen_ms = Some(now_ms);
                 }
             }
         }
@@ -366,28 +356,19 @@ impl World {
     /// duration, and the firmware rotates the beast when it changes.
     pub fn panel_line(&self, now_ms: u64) -> String {
         let now_s = (now_ms / 1000) as i64;
-        // -1 means "unknown", which the panel renders as "--". A stale number
-        // shown confidently is worse than an admitted gap.
-        let fresh = self
-            .boss_seen_ms
-            .is_some_and(|t| now_ms.saturating_sub(t) < BOSS_TTL_MS);
-        let hp = |w: Option<Window>| {
-            if !fresh {
-                return -1.0;
-            }
-            w.map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0)
-        };
-        let at = |w: Option<Window>| {
-            if !fresh {
-                return -1;
-            }
-            w.map(|w| (w.resets_at - now_s).max(0)).unwrap_or(-1)
-        };
-        let week = if fresh {
-            self.boss.seven_day.map(|w| w.resets_at).unwrap_or(-1)
-        } else {
-            -1
-        };
+        // -1 means "unknown", which the panel renders as "--". A reading is
+        // valid until its OWN window rolls, not for a fixed number of minutes.
+        //
+        // This was a flat 10-minute TTL, and combined with "only believe a
+        // session that just spent" it threw away a perfectly good reading after
+        // ten quiet minutes — the panel read BOSS HP UNKNOWN while 16 sessions
+        // were connected. Nobody spending means the quota has not CHANGED, not
+        // that it is unknown. Usage only accrues within a window, so an old
+        // reading is a lower bound; it becomes meaningless only at `resets_at`.
+        let live = |w: Option<Window>| w.filter(|w| w.resets_at > now_s);
+        let hp = |w: Option<Window>| live(w).map(|w| 100.0 - w.used_percentage).unwrap_or(-1.0);
+        let at = |w: Option<Window>| live(w).map(|w| (w.resets_at - now_s).max(0)).unwrap_or(-1);
+        let week = live(self.boss.seven_day).map(|w| w.resets_at).unwrap_or(-1);
         let mut v: Vec<&Fighter> = self.fighters.values().collect();
         v.sort_by(|a, b| (&a.machine, &a.session_id).cmp(&(&b.machine, &b.session_id)));
         let mut out = format!(
@@ -715,21 +696,27 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_in_the_past_clamps_to_zero_not_negative() {
+    fn a_window_whose_reset_has_passed_is_unknown_not_zero() {
+        // This used to assert the countdown clamped to 0. It no longer gets
+        // that far: a window past its resets_at describes a period that no
+        // longer exists, so it is dropped entirely rather than reported as
+        // "0 seconds left", which would read as a spent quota.
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
-        apply_busy(&mut w, &o, 9_000_000_000_000);
+        apply_busy(&mut w, &o, 1000);
         let head = w
             .panel_line(9_000_000_000_000)
             .lines()
             .next()
             .unwrap()
             .to_string();
-        assert_eq!(head.split(' ').nth(2).unwrap(), "0", "{head}");
+        assert!(head.starts_with("-1.0 -1.0 -1 -1 -1"), "{head}");
     }
 
     #[test]
-    fn stale_rate_limits_report_unknown_not_a_confident_wrong_number() {
+    fn a_reading_survives_a_quiet_period_but_not_its_own_window() {
+        // A flat TTL threw away a valid reading after ten quiet minutes and the
+        // panel read BOSS HP UNKNOWN with 16 sessions connected.
         let mut w = World::default();
         let o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
         apply_busy(&mut w, &o, 1000);
@@ -737,15 +724,20 @@ mod tests {
             w.panel_line(1000).starts_with("59.0"),
             "fresh should report"
         );
-        let head = w
-            .panel_line(1000 + BOSS_TTL_MS + 1)
-            .lines()
-            .next()
-            .unwrap()
-            .to_string();
+
+        // Hours of quiet, still inside the window: still valid.
+        let quiet = 1_756_000_000_000u64;
+        assert!(
+            w.panel_line(quiet).starts_with("59.0"),
+            "a quiet hour must not erase a valid reading"
+        );
+
+        // Past resets_at it describes a window that no longer exists.
+        let rolled = (1_757_400_000u64 + 1) * 1000;
+        let head = w.panel_line(rolled).lines().next().unwrap().to_string();
         assert!(
             head.starts_with("-1.0 -1.0 -1 -1 -1"),
-            "stale must be unknown: {head}"
+            "a rolled window is unknown: {head}"
         );
     }
 
