@@ -229,7 +229,17 @@ fn fighters_as_vec<S: serde::Serializer>(
 /// estimate, and it is monotonic. A larger `resets_at` means the window rolled,
 /// and the new one starts from its own value rather than inheriting the old
 /// maximum.
-fn merge_window(cur: Option<Window>, new: Option<Window>) -> Option<Window> {
+/// `authoritative` means the value came from polling `/api/oauth/usage`
+/// directly, so it is the truth as of the moment it was read — including when
+/// it goes DOWN.
+///
+/// Without that distinction usage could only ever climb inside a window. That
+/// is right for statusline payloads, which ride along on a session and may
+/// carry a stale snapshot, but it made a mid-window reset impossible to
+/// represent: when the weekly allowance was reset from 56% to 2% while
+/// `resets_at` stayed put, every fresh reading was discarded as a straggler and
+/// the boss stayed pinned at the high-water mark until the window rolled.
+fn merge_window(cur: Option<Window>, new: Option<Window>, authoritative: bool) -> Option<Window> {
     match (cur, new) {
         (_, None) => cur,
         (None, Some(n)) => Some(n),
@@ -237,8 +247,11 @@ fn merge_window(cur: Option<Window>, new: Option<Window>) -> Option<Window> {
             n // window rolled — start fresh
         } else if n.resets_at < c.resets_at {
             c // a straggler from the old window
-        } else if n.used_percentage > c.used_percentage {
-            n // same window, more usage seen
+        } else if authoritative || n.used_percentage > c.used_percentage {
+            // Same window. A direct endpoint read is believed in either
+            // direction; anything else is trusted only when it reports MORE,
+            // because an idle session's snapshot is stale, not corrected.
+            n
         } else {
             c
         }),
@@ -282,8 +295,9 @@ impl World {
         if worked {
             if let Some(rl) = o.rate_limits.clone() {
                 if rl.five_hour.is_some() || rl.seven_day.is_some() {
-                    self.boss.five_hour = merge_window(self.boss.five_hour, rl.five_hour);
-                    self.boss.seven_day = merge_window(self.boss.seven_day, rl.seven_day);
+                    let auth = o.source == Source::Usage;
+                    self.boss.five_hour = merge_window(self.boss.five_hour, rl.five_hour, auth);
+                    self.boss.seven_day = merge_window(self.boss.seven_day, rl.seven_day, auth);
                 }
             }
         }
@@ -456,6 +470,72 @@ mod tests {
     fn zone_is_stable_and_differs_per_repo() {
         assert_eq!(zone_id(Some("a/b"), None), zone_id(Some("a/b"), None));
         assert_ne!(zone_id(Some("a/b"), None), zone_id(Some("a/c"), None));
+    }
+
+    #[test]
+    fn a_direct_usage_read_may_lower_the_window_a_statusline_may_not() {
+        // The allowance can be reset INSIDE a window: utilization drops while
+        // resets_at stays put. The high-water rule made that unrepresentable —
+        // the weekly sat at 56% used for a day after a reset to 2%, because
+        // every fresh reading looked like a straggler.
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        o.rate_limits = Some(RateLimits {
+            five_hour: None,
+            seven_day: Some(Window {
+                used_percentage: 56.0,
+                resets_at: 1788696001,
+            }),
+        });
+        apply_busy(&mut w, &o, 1000);
+        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 56.0);
+
+        // A statusline claiming less, same window: still ignored. Idle sessions
+        // carry stale snapshots and must not drag the boss backwards.
+        o.rate_limits = Some(RateLimits {
+            five_hour: None,
+            seven_day: Some(Window {
+                used_percentage: 2.0,
+                resets_at: 1788696001,
+            }),
+        });
+        apply_busy(&mut w, &o, 2000);
+        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 56.0);
+
+        // The same numbers from a direct /api/oauth/usage poll ARE believed.
+        // apply_busy() forces Source::Statusline, so this must go via apply().
+        o.source = Source::Usage;
+        w.apply(o.clone(), 3000);
+        assert_eq!(w.boss.seven_day.unwrap().used_percentage, 2.0);
+    }
+
+    #[test]
+    fn a_stale_usage_read_cannot_undo_a_rolled_window() {
+        // Authoritative does not mean "newest wins regardless": a poll in
+        // flight while the window rolls carries the OLD resets_at and must
+        // still lose to the window that already started.
+        let mut w = World::default();
+        let mut o = Observation::from_statusline(&statusline(), "mbp", 1).unwrap();
+        o.source = Source::Usage;
+        o.rate_limits = Some(RateLimits {
+            five_hour: None,
+            seven_day: Some(Window {
+                used_percentage: 3.0,
+                resets_at: 1789300000,
+            }),
+        });
+        w.apply(o.clone(), 1000);
+        o.rate_limits = Some(RateLimits {
+            five_hour: None,
+            seven_day: Some(Window {
+                used_percentage: 91.0,
+                resets_at: 1788696001,
+            }),
+        });
+        w.apply(o.clone(), 2000);
+        let got = w.boss.seven_day.unwrap();
+        assert_eq!(got.used_percentage, 3.0);
+        assert_eq!(got.resets_at, 1789300000);
     }
 
     #[test]
